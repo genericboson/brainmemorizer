@@ -4,23 +4,39 @@ import 'app_navigation.dart';
 import 'app_state.dart';
 import 'desktop/desktop_shell.dart';
 import 'screens/input_tab.dart';
+import 'screens/settings_page.dart';
 import 'screens/study_tab.dart';
+import 'services/startup_settings.dart';
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
   final state = await AppState.load();
   final navigation = AppNavigation();
+  StartupSettings? startupSettings;
   if (DesktopShell.isSupported) {
     await DesktopShell(state: state, navigation: navigation).init();
+    startupSettings = NativeStartupSettings(appName: DesktopShell.appName);
   }
-  runApp(BrainMemorizerApp(state: state, navigation: navigation));
+  runApp(
+    BrainMemorizerApp(
+      state: state,
+      navigation: navigation,
+      startupSettings: startupSettings,
+    ),
+  );
 }
 
 class BrainMemorizerApp extends StatelessWidget {
-  const BrainMemorizerApp({super.key, required this.state, this.navigation});
+  const BrainMemorizerApp({
+    super.key,
+    required this.state,
+    this.navigation,
+    this.startupSettings,
+  });
 
   final AppState state;
   final AppNavigation? navigation;
+  final StartupSettings? startupSettings;
 
   @override
   Widget build(BuildContext context) {
@@ -29,16 +45,26 @@ class BrainMemorizerApp extends StatelessWidget {
       theme: ThemeData(
         colorScheme: ColorScheme.fromSeed(seedColor: Colors.deepPurple),
       ),
-      home: HomePage(state: state, navigation: navigation),
+      home: HomePage(
+        state: state,
+        navigation: navigation,
+        startupSettings: startupSettings,
+      ),
     );
   }
 }
 
 class HomePage extends StatefulWidget {
-  const HomePage({super.key, required this.state, this.navigation});
+  const HomePage({
+    super.key,
+    required this.state,
+    this.navigation,
+    this.startupSettings,
+  });
 
   final AppState state;
   final AppNavigation? navigation;
+  final StartupSettings? startupSettings;
 
   @override
   State<HomePage> createState() => _HomePageState();
@@ -71,6 +97,18 @@ class _HomePageState extends State<HomePage>
     return Scaffold(
       appBar: AppBar(
         title: const Text(DesktopShell.appName),
+        actions: [
+          IconButton(
+            tooltip: '설정',
+            icon: const Icon(Icons.settings),
+            onPressed: () => Navigator.of(context).push(
+              MaterialPageRoute<void>(
+                builder: (_) =>
+                    SettingsPage(startupSettings: widget.startupSettings),
+              ),
+            ),
+          ),
+        ],
         bottom: TabBar(
           controller: _tabs,
           tabs: const [
