@@ -1,8 +1,11 @@
 ﻿# brainmemorizer 를 릴리스 APK 로 빌드해 USB 로 연결된 폰에 설치하고 실행한다.
 #   deploy.ps1                 연결된 폰이 하나면 그 폰, 아니면 지난번 폰(device.txt)
 #   deploy.ps1 -Serial XXXX    특정 폰
+#   deploy.ps1 -Wireless 192.168.0.9:33795   무선 디버깅으로 먼저 연결한 뒤 그 폰에 배포
+#                                            (처음 한 번은 adb pair <ip:페어링포트> <코드> 가 먼저 필요)
 param(
   [string]$Serial = '',
+  [string]$Wireless = '',
   [switch]$Debug   # 릴리스 대신 디버그 빌드
 )
 $ErrorActionPreference = 'Stop'
@@ -21,6 +24,11 @@ $env:ANDROID_HOME = $SdkRoot
 
 # ---- 기기 고르기 -----------------------------------------------------------
 & $Adb start-server | Out-Null
+if ($Wireless) {
+  $out = & $Adb connect $Wireless
+  if ($out -notmatch 'connected to') { Write-Host "무선 연결 실패: $out"; exit 2 }
+  $Serial = $Wireless
+}
 $lines = & $Adb devices -l | Select-Object -Skip 1 | Where-Object { $_.Trim() }
 $devices = foreach ($l in $lines) {
   $parts = $l -split '\s+'
@@ -33,7 +41,8 @@ if ($unauthorized) {
   Write-Host "폰에서 'USB 디버깅을 허용하시겠습니까?' 창에 허용을 누른 뒤 다시 실행하세요: $($unauthorized.Serial -join ', ')"
   exit 2
 }
-$ready = @($devices | Where-Object State -eq 'device')
+# 무선 디버깅 폰은 ip:port 와 mDNS 이름(...:_adb-tls-connect._tcp)으로 두 번 잡힌다. mDNS 항목은 뺀다.
+$ready = @($devices | Where-Object { $_.State -eq 'device' -and $_.Serial -notlike '*_adb-tls-connect*' })
 if ($ready.Count -eq 0) {
   Write-Host 'no devices: 연결된 안드로이드 기기가 없습니다. USB 케이블과 USB 디버깅 설정을 확인하세요.'
   exit 2
