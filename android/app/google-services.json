@@ -1,0 +1,29 @@
+{
+  "project_info": {
+    "project_number": "223448086780",
+    "project_id": "brainmemorizer",
+    "storage_bucket": "brainmemorizer.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:223448086780:android:99b037f07659d0af8ebf79",
+        "android_client_info": {
+          "package_name": "com.brainmemorizer.brainmemorizer"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyCWN1eaduNcRYRJarVYX7HHsZ3dTBEJmZA"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}

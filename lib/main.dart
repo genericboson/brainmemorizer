@@ -1,12 +1,20 @@
+import 'dart:async';
+
+import 'package:cloud_firestore/cloud_firestore.dart';
+import 'package:firebase_auth/firebase_auth.dart';
+import 'package:firebase_core/firebase_core.dart';
 import 'package:flutter/material.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 
 import 'app_navigation.dart';
 import 'app_state.dart';
 import 'desktop/desktop_shell.dart';
+import 'firebase_options.dart';
 import 'screens/input_tab.dart';
 import 'screens/settings_page.dart';
 import 'screens/study_tab.dart';
 import 'services/startup_settings.dart';
+import 'services/sync_service.dart';
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -17,13 +25,40 @@ Future<void> main() async {
     await DesktopShell(state: state, navigation: navigation).init();
     startupSettings = NativeStartupSettings(appName: DesktopShell.appName);
   }
+  final sync = await _startSync(state);
   runApp(
     BrainMemorizerApp(
       state: state,
       navigation: navigation,
       startupSettings: startupSettings,
+      sync: sync,
     ),
   );
+}
+
+/// Firebase 를 켜고 동기화를 시작한다. 실패해도 앱은 로컬 데이터로 그냥 돈다.
+Future<SyncService?> _startSync(AppState state) async {
+  try {
+    await Firebase.initializeApp(
+      options: DefaultFirebaseOptions.currentPlatform,
+    );
+    final sync = SyncService(
+      state: state,
+      firestore: FirebaseFirestore.instance,
+      prefs: await SharedPreferences.getInstance(),
+      signIn: () async {
+        if (FirebaseAuth.instance.currentUser == null) {
+          await FirebaseAuth.instance.signInAnonymously();
+        }
+      },
+    );
+    // 연결은 기다리지 않는다. 오프라인이면 설정 화면에 "연결 안 됨"으로 보인다.
+    unawaited(sync.start());
+    return sync;
+  } catch (e) {
+    debugPrint('동기화 초기화 실패: $e');
+    return null;
+  }
 }
 
 class BrainMemorizerApp extends StatelessWidget {
@@ -32,11 +67,13 @@ class BrainMemorizerApp extends StatelessWidget {
     required this.state,
     this.navigation,
     this.startupSettings,
+    this.sync,
   });
 
   final AppState state;
   final AppNavigation? navigation;
   final StartupSettings? startupSettings;
+  final SyncService? sync;
 
   @override
   Widget build(BuildContext context) {
@@ -49,6 +86,7 @@ class BrainMemorizerApp extends StatelessWidget {
         state: state,
         navigation: navigation,
         startupSettings: startupSettings,
+        sync: sync,
       ),
     );
   }
@@ -60,11 +98,13 @@ class HomePage extends StatefulWidget {
     required this.state,
     this.navigation,
     this.startupSettings,
+    this.sync,
   });
 
   final AppState state;
   final AppNavigation? navigation;
   final StartupSettings? startupSettings;
+  final SyncService? sync;
 
   @override
   State<HomePage> createState() => _HomePageState();
@@ -103,8 +143,10 @@ class _HomePageState extends State<HomePage>
             icon: const Icon(Icons.settings),
             onPressed: () => Navigator.of(context).push(
               MaterialPageRoute<void>(
-                builder: (_) =>
-                    SettingsPage(startupSettings: widget.startupSettings),
+                builder: (_) => SettingsPage(
+                  startupSettings: widget.startupSettings,
+                  sync: widget.sync,
+                ),
               ),
             ),
           ),

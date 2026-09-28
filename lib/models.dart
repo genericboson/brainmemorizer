@@ -1,15 +1,36 @@
 import 'memory_model.dart';
 
+/// 저장된 데이터에 갱신 시각이 없을 때 쓰는 값. 어떤 원격 사본보다도 오래됐다고 본다.
+final DateTime epoch = DateTime.fromMillisecondsSinceEpoch(0);
+
+DateTime _readTime(Map<String, dynamic> json, String key) {
+  final v = json[key];
+  if (v is int) return DateTime.fromMillisecondsSinceEpoch(v);
+  if (v is String) return DateTime.parse(v);
+  return epoch;
+}
+
 class StudyCategory {
-  StudyCategory({required this.id, required this.name});
+  StudyCategory({required this.id, required this.name, DateTime? updatedAt})
+    : updatedAt = updatedAt ?? epoch;
 
   final String id;
   String name;
 
-  factory StudyCategory.fromJson(Map<String, dynamic> json) =>
-      StudyCategory(id: json['id'] as String, name: json['name'] as String);
+  /// 마지막으로 바뀐 시각. 기기 간 동기화에서 최신 사본을 고르는 기준.
+  DateTime updatedAt;
 
-  Map<String, dynamic> toJson() => {'id': id, 'name': name};
+  factory StudyCategory.fromJson(Map<String, dynamic> json) => StudyCategory(
+    id: json['id'] as String,
+    name: json['name'] as String,
+    updatedAt: _readTime(json, 'updatedAt'),
+  );
+
+  Map<String, dynamic> toJson() => {
+    'id': id,
+    'name': name,
+    'updatedAt': updatedAt.millisecondsSinceEpoch,
+  };
 }
 
 /// 서브카테고리 개수. 서브카테고리 N 에는 중요도 등급이 N 이하인 카드가 들어간다.
@@ -28,7 +49,8 @@ class StudyCard {
     this.reviewCount = 0,
     this.lapseCount = 0,
     this.lastReviewedAt,
-  });
+    DateTime? updatedAt,
+  }) : updatedAt = updatedAt ?? epoch;
 
   final String id;
   final String categoryId;
@@ -42,6 +64,9 @@ class StudyCard {
   int lapseCount;
   DateTime? lastReviewedAt;
   DateTime dueAt;
+
+  /// 마지막으로 바뀐 시각. 기기 간 동기화에서 최신 사본을 고르는 기준.
+  DateTime updatedAt;
 
   bool get isNew => lastReviewedAt == null;
 
@@ -60,6 +85,7 @@ class StudyCard {
         ? null
         : DateTime.parse(json['lastReviewedAt'] as String),
     dueAt: DateTime.parse(json['dueAt'] as String),
+    updatedAt: _readTime(json, 'updatedAt'),
   );
 
   Map<String, dynamic> toJson() => {
@@ -73,7 +99,18 @@ class StudyCard {
     'lapseCount': lapseCount,
     'lastReviewedAt': lastReviewedAt?.toIso8601String(),
     'dueAt': dueAt.toIso8601String(),
+    'updatedAt': updatedAt.millisecondsSinceEpoch,
   };
+
+  /// 다른 사본의 내용을 이 카드에 덮어쓴다 (id, categoryId, question, answer 는 같다고 본다).
+  void copyFrom(StudyCard other) {
+    stability = other.stability;
+    reviewCount = other.reviewCount;
+    lapseCount = other.lapseCount;
+    lastReviewedAt = other.lastReviewedAt;
+    dueAt = other.dueAt;
+    updatedAt = other.updatedAt;
+  }
 }
 
 /// 단답형 채점: 대소문자와 공백 차이는 무시한다.

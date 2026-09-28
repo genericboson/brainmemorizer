@@ -1,0 +1,14 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // 데이터는 spaces/{연결 코드} 아래에만 있다. 코드는 12자리 무작위라
+    // 아는 사람만 접근할 수 있고, 익명이라도 로그인은 해야 한다.
+    match /spaces/{spaceId}/{document=**} {
+      allow read, write: if request.auth != null
+        && spaceId.matches('^[A-Z2-9]{4}-[A-Z2-9]{4}-[A-Z2-9]{4}$');
+    }
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}
