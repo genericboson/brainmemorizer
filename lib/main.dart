@@ -1,8 +1,10 @@
 import 'dart:async';
+import 'dart:io';
 
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:firebase_core/firebase_core.dart';
+import 'package:flutter/foundation.dart' show kDebugMode;
 import 'package:flutter/material.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
@@ -36,8 +38,27 @@ Future<void> main() async {
   );
 }
 
+/// 디버그 빌드에서만: 이 앱 프로세스가 Firebase 서버에 HTTPS 로 닿는지 기록한다.
+Future<void> _probeNetwork() async {
+  if (!kDebugMode) return;
+  for (final host in ['identitytoolkit.googleapis.com', 'www.google.com']) {
+    try {
+      final client = HttpClient()
+        ..connectionTimeout = const Duration(seconds: 8);
+      final response = await client
+          .getUrl(Uri.https(host, '/'))
+          .then((r) => r.close());
+      debugPrint('네트워크 진단 $host: HTTP ${response.statusCode}');
+      client.close(force: true);
+    } catch (e) {
+      debugPrint('네트워크 진단 $host: 실패 $e');
+    }
+  }
+}
+
 /// Firebase 를 켜고 동기화를 시작한다. 실패해도 앱은 로컬 데이터로 그냥 돈다.
 Future<SyncService?> _startSync(AppState state) async {
+  unawaited(_probeNetwork());
   try {
     await Firebase.initializeApp(
       options: DefaultFirebaseOptions.currentPlatform,
