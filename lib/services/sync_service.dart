@@ -19,9 +19,19 @@ class SyncService extends ChangeNotifier {
     required FirebaseFirestore firestore,
     required SharedPreferences prefs,
     Future<void> Function()? signIn,
+    this.initialRetry = const Duration(seconds: 5),
+    this.maxRetry = const Duration(minutes: 5),
   }) : _firestore = firestore, // ignore: prefer_initializing_formals
        _prefs = prefs, // ignore: prefer_initializing_formals
-       _signIn = signIn; // ignore: prefer_initializing_formals
+       _signIn = signIn, // ignore: prefer_initializing_formals
+       _retryDelay = initialRetry;
+
+  /// 연결에 실패했을 때 다시 시도하기까지의 간격. 실패할 때마다 두 배로 늘어
+  /// [maxRetry] 까지 간다.
+  final Duration initialRetry;
+  final Duration maxRetry;
+  Duration _retryDelay;
+  Timer? _retryTimer;
 
   static const _keyPref = 'brainmemorizer.syncKey';
 
@@ -76,18 +86,29 @@ class SyncService extends ChangeNotifier {
       _firestore.collection('spaces').doc(_syncKey);
 
   Future<void> start() async {
+    _localSubscription ??= state.changes.listen(_pushChange);
+    await _connect();
+  }
+
+  /// 로그인하고, 원격을 구독하고, 로컬 전체를 밀어 넣는다.
+  /// 실패하면 [_retryDelay] 뒤에 다시 시도한다 (오프라인 시작, 일시적 네트워크 오류).
+  Future<void> _connect() async {
+    _retryTimer?.cancel();
     try {
       await _signIn?.call();
-      _subscribeRemote();
-      _localSubscription = state.changes.listen(_pushChange);
+      if (_subscriptions.isEmpty) _subscribeRemote();
       await _pushAll();
       _connected = true;
       _lastError = null;
+      _retryDelay = initialRetry;
       debugPrint('동기화 연결됨: 연결 코드 $_syncKey');
     } catch (e) {
       _connected = false;
       _lastError = '$e';
-      debugPrint('동기화 연결 실패: $e');
+      debugPrint('동기화 연결 실패 (${_retryDelay.inSeconds}초 뒤 재시도): $e');
+      _retryTimer = Timer(_retryDelay, _connect);
+      final doubled = _retryDelay * 2;
+      _retryDelay = doubled > maxRetry ? maxRetry : doubled;
     }
     notifyListeners();
   }
@@ -113,6 +134,7 @@ class SyncService extends ChangeNotifier {
 
   @override
   void dispose() {
+    _retryTimer?.cancel();
     _cancelRemote();
     _localSubscription?.cancel();
     super.dispose();
@@ -175,16 +197,15 @@ class SyncService extends ChangeNotifier {
   Future<void> _pushAll() => _write(state.snapshotChanges());
 
   Future<void> _pushChange(StateChange change) async {
+    if (!_connected) return; // 재연결될 때 _pushAll 이 전체를 다시 보낸다.
     try {
       await _write([change]);
-      if (!_connected) {
-        _connected = true;
-        _lastError = null;
-        notifyListeners();
-      }
     } catch (e) {
+      // 이 변경은 못 보냈다. 재연결하면서 전체를 다시 밀어 넣는다.
       _connected = false;
       _lastError = '$e';
+      _retryTimer?.cancel();
+      _retryTimer = Timer(_retryDelay, _connect);
       notifyListeners();
     }
   }

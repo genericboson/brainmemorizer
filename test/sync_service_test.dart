@@ -202,6 +202,40 @@ void main() {
     expect(a.state.cards.length, 2);
   });
 
+  test('keeps retrying sign-in until it succeeds, then syncs', () async {
+    SharedPreferences.setMockInitialValues({
+      'brainmemorizer.syncKey': 'AAAA-AAAA-AAAA',
+    });
+    final prefs = await SharedPreferences.getInstance();
+    final state = await AppState.load(clock: clock);
+    var attempts = 0;
+    final sync = SyncService(
+      state: state,
+      firestore: firestore,
+      prefs: prefs,
+      initialRetry: const Duration(milliseconds: 10),
+      signIn: () async {
+        if (++attempts < 3) throw Exception('network-request-failed');
+      },
+    );
+    await sync.start();
+    expect(sync.connected, isFalse);
+    expect(sync.lastError, contains('network-request-failed'));
+
+    // 연결 전 변경은 재연결 때 전체 푸시로 따라간다.
+    state.addCategory('오프라인에서 만듦');
+    await Future<void>.delayed(const Duration(milliseconds: 100));
+    expect(attempts, 3);
+    expect(sync.connected, isTrue);
+    final docs = await firestore
+        .collection('spaces')
+        .doc('AAAA-AAAA-AAAA')
+        .collection('categories')
+        .get();
+    expect(docs.docs.single.data()['name'], '오프라인에서 만듦');
+    sync.dispose();
+  });
+
   test('old local data without timestamps loads and syncs', () async {
     SharedPreferences.setMockInitialValues({
       'brainmemorizer.data.v1':
