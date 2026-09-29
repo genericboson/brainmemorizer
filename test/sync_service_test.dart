@@ -1,15 +1,62 @@
+import 'dart:async';
+
 import 'package:brainmemorizer/app_state.dart';
 import 'package:brainmemorizer/models.dart';
+import 'package:brainmemorizer/services/auth_gateway.dart';
 import 'package:brainmemorizer/services/sync_service.dart';
 import 'package:fake_cloud_firestore/fake_cloud_firestore.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
-/// 두 "기기": 각자 AppState 를 갖고 같은 (가짜) Firestore 를 본다.
+/// 가짜 로그인. 계정은 이메일 -> 비밀번호 표로 들고 있고, uid 는 이메일에서 만든다.
+class FakeAuthGateway implements AuthGateway {
+  FakeAuthGateway({this.accounts = const {}, AuthUser? initialUser})
+    : _user = initialUser;
+
+  final Map<String, String> accounts;
+  AuthUser? _user;
+  final _controller = StreamController<AuthUser?>.broadcast();
+
+  @override
+  AuthUser? get currentUser => _user;
+
+  /// 구독 즉시 현재 사용자를 내보내고, 그 자리에서 컨트롤러 구독을 걸어
+  /// 이후 이벤트를 놓치지 않는다 (async* 로 하면 첫 yield 뒤에야 구독된다).
+  @override
+  Stream<AuthUser?> get userChanges => Stream.multi((listener) {
+    listener.add(_user);
+    final sub = _controller.stream.listen(listener.add);
+    listener.onCancel = sub.cancel;
+  });
+
+  void _set(AuthUser? user) {
+    _user = user;
+    _controller.add(user);
+  }
+
+  @override
+  Future<void> signIn(String email, String password) async {
+    if (accounts[email] != password) {
+      throw AuthException('이메일 또는 비밀번호가 맞지 않습니다.');
+    }
+    _set(AuthUser(uid: 'uid-$email', email: email));
+  }
+
+  @override
+  Future<void> signUp(String email, String password) async {
+    if (accounts.containsKey(email)) throw AuthException('이미 가입된 이메일입니다.');
+    _set(AuthUser(uid: 'uid-$email', email: email));
+  }
+
+  @override
+  Future<void> signOut() async => _set(null);
+}
+
 class Device {
-  Device(this.state, this.sync);
+  Device(this.state, this.sync, this.auth);
   final AppState state;
   final SyncService sync;
+  final FakeAuthGateway auth;
 }
 
 void main() {
@@ -17,99 +64,134 @@ void main() {
   var clockMs = DateTime(2026, 1, 1, 9).millisecondsSinceEpoch;
   DateTime clock() => DateTime.fromMillisecondsSinceEpoch(clockMs);
   void tick() => clockMs += 1000;
+  const accounts = {'me@test.com': 'secret123'};
+  const me = AuthUser(uid: 'uid-me@test.com', email: 'me@test.com');
 
   setUp(() {
     firestore = FakeFirebaseFirestore();
     clockMs = DateTime(2026, 1, 1, 9).millisecondsSinceEpoch;
   });
 
-  Future<Device> device({String? key}) async {
-    // 기기마다 다른 로컬 저장소.
-    SharedPreferences.setMockInitialValues({'brainmemorizer.syncKey': ?key});
+  /// 기기마다 다른 로컬 저장소와 로그인 상태를 가진 "기기"를 만든다.
+  Future<Device> device({AuthUser? loggedInAs, bool? autoLogin}) async {
+    SharedPreferences.setMockInitialValues({
+      'brainmemorizer.autoLogin': ?autoLogin,
+    });
     final prefs = await SharedPreferences.getInstance();
     final state = await AppState.load(clock: clock);
-    final sync = SyncService(state: state, firestore: firestore, prefs: prefs);
+    final auth = FakeAuthGateway(accounts: accounts, initialUser: loggedInAs);
+    final sync = SyncService(
+      state: state,
+      firestore: firestore,
+      prefs: prefs,
+      auth: auth,
+    );
     await sync.start();
-    return Device(state, sync);
+    return Device(state, sync, auth);
   }
 
   // 가짜 Firestore 가 스냅샷을 돌리는 데 이벤트 루프 몇 바퀴가 걸린다.
   Future<void> settle() =>
       Future<void>.delayed(const Duration(milliseconds: 20));
 
-  test('generates and stores a well-formed key', () async {
+  Future<List<String>> remoteCardQuestions() async =>
+      (await firestore
+              .collection('users')
+              .doc(me.uid)
+              .collection('cards')
+              .get())
+          .docs
+          .map((d) => d.data()['question'] as String)
+          .toList();
+
+  test('nothing is synced while logged out', () async {
     final d = await device();
-    expect(SyncService.normalizeKey(d.sync.syncKey), d.sync.syncKey);
-    expect(d.sync.syncKey, matches(r'^[A-Z2-9]{4}-[A-Z2-9]{4}-[A-Z2-9]{4}$'));
+    await settle();
+    expect(d.sync.signedIn, isFalse);
+    expect(d.sync.connected, isFalse);
+    d.state.addCard(d.state.addCategory('c').id, 'q', 'a');
+    await settle();
+    expect((await firestore.collectionGroup('cards').get()).docs, isEmpty);
+  });
+
+  test('signing in connects and pushes existing local data', () async {
+    final d = await device();
+    d.state.addCard(d.state.addCategory('c').id, '오프라인에서 만듦', 'a');
+    expect(
+      await d.sync.signIn('me@test.com', 'secret123'),
+      isTrue,
+      reason: d.sync.lastError,
+    );
+    await settle();
+    expect(d.sync.signedIn, isTrue);
     expect(d.sync.connected, isTrue);
+    expect(d.sync.user?.email, 'me@test.com');
+    expect(await remoteCardQuestions(), ['오프라인에서 만듦']);
   });
 
-  test('normalizeKey accepts sloppy input and rejects bad input', () {
-    expect(SyncService.normalizeKey(' abcd efgh-jklm '), 'ABCD-EFGH-JKLM');
-    expect(SyncService.normalizeKey('ABCD-EFGH-JKL'), isNull);
-    expect(SyncService.normalizeKey('ABCD-EFGH-JKL0'), isNull); // 0 은 안 쓴다
+  test('wrong password reports a message and stays logged out', () async {
+    final d = await device();
+    expect(await d.sync.signIn('me@test.com', 'nope'), isFalse);
+    expect(d.sync.lastError, contains('맞지 않습니다'));
+    expect(d.sync.signedIn, isFalse);
   });
 
-  test('local changes are pushed to Firestore', () async {
-    final d = await device(key: 'AAAA-AAAA-AAAA');
-    final category = d.state.addCategory('수도');
-    d.state.addCard(category.id, 'q', 'a', grade: 3);
+  test('sign up creates the account and connects', () async {
+    final d = await device();
+    expect(
+      await d.sync.signUp('new@test.com', 'secret123'),
+      isTrue,
+      reason: d.sync.lastError,
+    );
+    await settle();
+    expect(d.sync.connected, isTrue);
+    expect(await d.sync.signUp('me@test.com', 'x'), isFalse);
+  });
+
+  test('auto login keeps the session; turning it off signs out', () async {
+    final kept = await device(loggedInAs: me);
+    await settle();
+    expect(kept.sync.signedIn, isTrue);
+    expect(kept.sync.autoLogin, isTrue);
+
+    final dropped = await device(loggedInAs: me, autoLogin: false);
+    await settle();
+    expect(dropped.sync.signedIn, isFalse);
+    expect(dropped.auth.currentUser, isNull);
+  });
+
+  test('two devices on the same account share data both ways', () async {
+    final a = await device(loggedInAs: me);
+    final b = await device(loggedInAs: me);
     await settle();
 
-    final space = firestore.collection('spaces').doc('AAAA-AAAA-AAAA');
-    final cat = await space.collection('categories').doc(category.id).get();
-    expect(cat.data()!['name'], '수도');
-    final cards = await space.collection('cards').get();
-    expect(cards.docs.single.data()['grade'], 3);
-  });
-
-  test('a second device with the same key receives the data', () async {
-    final a = await device(key: 'AAAA-AAAA-AAAA');
     final category = a.state.addCategory('수도');
     a.state.addCard(category.id, '프랑스의 수도', '파리');
     await settle();
-
-    final b = await device(key: 'AAAA-AAAA-AAAA');
-    await settle();
-    expect(b.state.categories.single.name, '수도');
     expect(b.state.cards.single.question, '프랑스의 수도');
-    // 원격에서 받은 것은 다시 밀어 보내지 않는다 (문서 수 그대로).
-    final cards = await firestore
-        .collection('spaces')
-        .doc('AAAA-AAAA-AAAA')
-        .collection('cards')
-        .get();
-    expect(cards.docs.length, 1);
-  });
 
-  test('review on one device updates due time on the other', () async {
-    final a = await device(key: 'AAAA-AAAA-AAAA');
-    final category = a.state.addCategory('c');
-    a.state.addCard(category.id, 'q', 'a');
-    await settle();
-    final b = await device(key: 'AAAA-AAAA-AAAA');
-    await settle();
-
+    // B 에서 복습하면 A 의 복습 시점도 바뀐다.
     tick();
-    final cardOnB = b.state.cards.single;
-    b.state.recordAnswer(cardOnB, correct: true, failedThisSession: false);
+    b.state.recordAnswer(
+      b.state.cards.single,
+      correct: true,
+      failedThisSession: false,
+    );
     await settle();
+    expect(a.state.cards.single.dueAt, b.state.cards.single.dueAt);
+    expect(a.state.cards.single.isDue(clock()), isFalse);
 
-    final cardOnA = a.state.cards.single;
-    expect(cardOnA.dueAt, cardOnB.dueAt);
-    expect(cardOnA.reviewCount, 1);
-    expect(cardOnA.isDue(clock()), isFalse);
+    // 원격에서 받은 것은 되돌려 보내지 않는다.
+    expect((await remoteCardQuestions()).length, 1);
   });
 
-  test('newer copy wins regardless of direction', () async {
-    final a = await device(key: 'AAAA-AAAA-AAAA');
+  test('newest copy wins and stale remote copies are ignored', () async {
+    final a = await device(loggedInAs: me);
+    final b = await device(loggedInAs: me);
     final category = a.state.addCategory('c');
     a.state.addCard(category.id, 'q', 'a');
     await settle();
-    final b = await device(key: 'AAAA-AAAA-AAAA');
-    await settle();
 
-    // B 가 먼저 복습(t+1), A 가 나중에 복습(t+2): A 의 결과가 남아야 한다.
     tick();
     b.state.recordAnswer(
       b.state.cards.single,
@@ -124,12 +206,9 @@ void main() {
       failedThisSession: false,
     );
     await settle();
-
-    expect(a.state.cards.single.reviewCount, 2);
     expect(b.state.cards.single.reviewCount, 2);
     expect(b.state.cards.single.dueAt, a.state.cards.single.dueAt);
 
-    // 오래된 원격 사본은 무시된다.
     final stale = StudyCard(
       id: a.state.cards.single.id,
       categoryId: category.id,
@@ -141,33 +220,26 @@ void main() {
     expect(a.state.applyRemoteCard(stale), isFalse);
   });
 
-  test(
-    'deleting a category on one device removes it and its cards on the other',
-    () async {
-      final a = await device(key: 'AAAA-AAAA-AAAA');
-      final category = a.state.addCategory('c');
-      a.state.addCard(category.id, 'q1', 'a');
-      a.state.addCard(category.id, 'q2', 'a');
-      await settle();
-      final b = await device(key: 'AAAA-AAAA-AAAA');
-      await settle();
-      expect(b.state.cards.length, 2);
+  test('deleting a category on one device removes it on the other', () async {
+    final a = await device(loggedInAs: me);
+    final b = await device(loggedInAs: me);
+    final category = a.state.addCategory('c');
+    a.state.addCard(category.id, 'q1', 'a');
+    a.state.addCard(category.id, 'q2', 'a');
+    await settle();
+    expect(b.state.cards.length, 2);
 
-      a.state.deleteCategory(category.id);
-      await settle();
-      expect(b.state.categories, isEmpty);
-      expect(b.state.cards, isEmpty);
-    },
-  );
+    a.state.deleteCategory(category.id);
+    await settle();
+    expect(b.state.categories, isEmpty);
+    expect(b.state.cards, isEmpty);
+  });
 
   test('memory factor syncs to the newer value', () async {
-    final a = await device(key: 'AAAA-AAAA-AAAA');
-    final category = a.state.addCategory('c');
-    a.state.addCard(category.id, 'q', 'a');
-    final b = await device(key: 'AAAA-AAAA-AAAA');
+    final a = await device(loggedInAs: me);
+    final b = await device(loggedInAs: me);
+    a.state.addCard(a.state.addCategory('c').id, 'q', 'a');
     await settle();
-
-    // 두 번째 복습부터 배율이 움직인다.
     tick();
     a.state.recordAnswer(
       a.state.cards.single,
@@ -186,57 +258,24 @@ void main() {
     expect(b.state.memoryFactor, a.state.memoryFactor);
   });
 
-  test('useKey joins another device and merges both sides', () async {
-    final a = await device(key: 'AAAA-AAAA-AAAA');
-    a.state.addCard(a.state.addCategory('A쪽').id, 'qa', 'a');
-    final b = await device(key: 'BBBB-BBBB-BBBB');
-    b.state.addCard(b.state.addCategory('B쪽').id, 'qb', 'b');
+  test('signing out stops syncing; signing back in catches up', () async {
+    final a = await device(loggedInAs: me);
+    final b = await device(loggedInAs: me);
     await settle();
-
-    await b.sync.useKey('AAAA-AAAA-AAAA');
+    await b.sync.signOut();
     await settle();
+    expect(b.sync.signedIn, isFalse);
 
-    expect(b.sync.syncKey, 'AAAA-AAAA-AAAA');
-    expect(b.state.categories.map((c) => c.name), containsAll(['A쪽', 'B쪽']));
-    expect(a.state.categories.map((c) => c.name), containsAll(['A쪽', 'B쪽']));
-    expect(a.state.cards.length, 2);
+    a.state.addCard(a.state.addCategory('c').id, '로그아웃 중 추가', 'a');
+    await settle();
+    expect(b.state.cards, isEmpty);
+
+    await b.sync.signIn('me@test.com', 'secret123');
+    await settle();
+    expect(b.state.cards.single.question, '로그아웃 중 추가');
   });
 
-  test('keeps retrying sign-in until it succeeds, then syncs', () async {
-    SharedPreferences.setMockInitialValues({
-      'brainmemorizer.syncKey': 'AAAA-AAAA-AAAA',
-    });
-    final prefs = await SharedPreferences.getInstance();
-    final state = await AppState.load(clock: clock);
-    var attempts = 0;
-    final sync = SyncService(
-      state: state,
-      firestore: firestore,
-      prefs: prefs,
-      initialRetry: const Duration(milliseconds: 10),
-      signIn: () async {
-        if (++attempts < 3) throw Exception('network-request-failed');
-      },
-    );
-    await sync.start();
-    expect(sync.connected, isFalse);
-    expect(sync.lastError, contains('network-request-failed'));
-
-    // 연결 전 변경은 재연결 때 전체 푸시로 따라간다.
-    state.addCategory('오프라인에서 만듦');
-    await Future<void>.delayed(const Duration(milliseconds: 100));
-    expect(attempts, 3);
-    expect(sync.connected, isTrue);
-    final docs = await firestore
-        .collection('spaces')
-        .doc('AAAA-AAAA-AAAA')
-        .collection('categories')
-        .get();
-    expect(docs.docs.single.data()['name'], '오프라인에서 만듦');
-    sync.dispose();
-  });
-
-  test('old local data without timestamps loads and syncs', () async {
+  test('old local data without timestamps loads', () async {
     SharedPreferences.setMockInitialValues({
       'brainmemorizer.data.v1':
           '{"memoryFactor":1.0,"categories":[{"id":"c","name":"옛날"}],'

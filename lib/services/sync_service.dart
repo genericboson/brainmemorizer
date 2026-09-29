@@ -1,5 +1,4 @@
 import 'dart:async';
-import 'dart:math';
 
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:flutter/foundation.dart';
@@ -7,24 +6,32 @@ import 'package:shared_preferences/shared_preferences.dart';
 
 import '../app_state.dart';
 import '../models.dart';
+import 'auth_gateway.dart';
 
-/// 기기 간 동기화. 로컬 [AppState] 를 Firestore 의 `spaces/{연결 코드}` 아래에
-/// 비추고, 같은 코드를 쓰는 다른 기기의 변경을 받아 온다.
+/// 기기 간 동기화. 로그인한 계정의 `users/{uid}` 아래에 로컬 [AppState] 를
+/// 비추고, 같은 계정으로 로그인한 다른 기기의 변경을 받아 온다.
 ///
-/// 로컬이 원본이다: 앱은 네트워크 없이도 그대로 동작하고, 연결되면
-/// 양쪽 변경이 `updatedAt` 이 최신인 쪽으로 합쳐진다.
+/// 로컬이 원본이다: 앱은 로그인하지 않아도, 네트워크가 없어도 그대로 동작하고,
+/// 연결되면 양쪽 변경이 `updatedAt` 이 최신인 쪽으로 합쳐진다.
 class SyncService extends ChangeNotifier {
   SyncService({
     required this.state,
     required FirebaseFirestore firestore,
     required SharedPreferences prefs,
-    Future<void> Function()? signIn,
+    required AuthGateway auth,
     this.initialRetry = const Duration(seconds: 5),
     this.maxRetry = const Duration(minutes: 5),
   }) : _firestore = firestore, // ignore: prefer_initializing_formals
        _prefs = prefs, // ignore: prefer_initializing_formals
-       _signIn = signIn, // ignore: prefer_initializing_formals
+       _auth = auth, // ignore: prefer_initializing_formals
        _retryDelay = initialRetry;
+
+  static const _autoLoginPref = 'brainmemorizer.autoLogin';
+
+  final AppState state;
+  final FirebaseFirestore _firestore;
+  final SharedPreferences _prefs;
+  final AuthGateway _auth;
 
   /// 연결에 실패했을 때 다시 시도하기까지의 간격. 실패할 때마다 두 배로 늘어
   /// [maxRetry] 까지 간다.
@@ -33,75 +40,99 @@ class SyncService extends ChangeNotifier {
   Duration _retryDelay;
   Timer? _retryTimer;
 
-  static const _keyPref = 'brainmemorizer.syncKey';
-
-  /// 연결 코드에 쓰는 글자. 헷갈리는 0/O, 1/I 는 뺐다.
-  static const _alphabet = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
-
-  final AppState state;
-  final FirebaseFirestore _firestore;
-  final SharedPreferences _prefs;
-  final Future<void> Function()? _signIn;
-
   final List<StreamSubscription<dynamic>> _subscriptions = [];
   StreamSubscription<StateChange>? _localSubscription;
+  StreamSubscription<AuthUser?>? _authSubscription;
 
-  late String _syncKey = _prefs.getString(_keyPref) ?? _storeKey(newKey());
+  String? _uid;
 
-  /// 이 기기의 연결 코드. 다른 기기에 이 코드를 넣으면 같은 데이터를 쓴다.
-  String get syncKey => _syncKey;
+  AuthUser? get user => _auth.currentUser;
+  bool get signedIn => _uid != null;
+
+  /// 앱을 다시 켤 때 로그인을 유지할지. 끄면 다음 시작 때 로그아웃된 상태로 뜬다.
+  bool get autoLogin => _prefs.getBool(_autoLoginPref) ?? true;
 
   bool _connected = false;
   bool get connected => _connected;
 
+  bool _busy = false;
+  bool get busy => _busy;
+
   String? _lastError;
   String? get lastError => _lastError;
 
-  /// `ABCD-EFGH-JKLM` 꼴의 새 코드.
-  static String newKey() {
-    final rng = Random.secure();
-    final chars = List.generate(
-      12,
-      (_) => _alphabet[rng.nextInt(_alphabet.length)],
-    ).join();
-    return '${chars.substring(0, 4)}-${chars.substring(4, 8)}-${chars.substring(8)}';
+  Future<void> setAutoLogin(bool value) async {
+    await _prefs.setBool(_autoLoginPref, value);
+    notifyListeners();
   }
-
-  /// 사용자가 입력한 코드를 정리한다. 형식이 틀리면 null.
-  static String? normalizeKey(String input) {
-    final chars = input.toUpperCase().replaceAll(RegExp('[^A-Z2-9]'), '');
-    if (chars.length != 12 ||
-        chars.split('').any((c) => !_alphabet.contains(c))) {
-      return null;
-    }
-    return '${chars.substring(0, 4)}-${chars.substring(4, 8)}-${chars.substring(8)}';
-  }
-
-  String _storeKey(String key) {
-    _prefs.setString(_keyPref, key);
-    return key;
-  }
-
-  DocumentReference<Map<String, dynamic>> get _space =>
-      _firestore.collection('spaces').doc(_syncKey);
 
   Future<void> start() async {
+    if (!autoLogin && _auth.currentUser != null) {
+      await _auth.signOut();
+    }
     _localSubscription ??= state.changes.listen(_pushChange);
-    await _connect();
+    _authSubscription ??= _auth.userChanges.listen(_onUserChanged);
   }
 
-  /// 로그인하고, 원격을 구독하고, 로컬 전체를 밀어 넣는다.
+  Future<bool> signIn(String email, String password) =>
+      _authAction(() => _auth.signIn(email.trim(), password));
+
+  Future<bool> signUp(String email, String password) =>
+      _authAction(() => _auth.signUp(email.trim(), password));
+
+  Future<void> signOut() => _auth.signOut();
+
+  Future<bool> _authAction(Future<void> Function() action) async {
+    _busy = true;
+    _lastError = null;
+    notifyListeners();
+    try {
+      await action();
+      return true;
+    } on AuthException catch (e) {
+      _lastError = e.message;
+      return false;
+    } catch (e) {
+      _lastError = '$e';
+      return false;
+    } finally {
+      _busy = false;
+      notifyListeners();
+    }
+  }
+
+  @override
+  void dispose() {
+    _retryTimer?.cancel();
+    _cancelRemote();
+    _localSubscription?.cancel();
+    _authSubscription?.cancel();
+    super.dispose();
+  }
+
+  // ---- 로그인 상태 ---------------------------------------------------------
+
+  Future<void> _onUserChanged(AuthUser? user) async {
+    _retryTimer?.cancel();
+    _cancelRemote();
+    _connected = false;
+    _uid = user?.uid;
+    notifyListeners();
+    if (user != null) await _connect();
+  }
+
+  /// 원격을 구독하고 로컬 전체를 밀어 넣는다.
   /// 실패하면 [_retryDelay] 뒤에 다시 시도한다 (오프라인 시작, 일시적 네트워크 오류).
   Future<void> _connect() async {
     _retryTimer?.cancel();
+    if (_uid == null) return;
     try {
-      await _signIn?.call();
       if (_subscriptions.isEmpty) _subscribeRemote();
       await _pushAll();
       _connected = true;
       _lastError = null;
       _retryDelay = initialRetry;
-      debugPrint('동기화 연결됨: 연결 코드 $_syncKey');
+      debugPrint('동기화 연결됨: ${user?.email}');
     } catch (e) {
       _connected = false;
       _lastError = '$e';
@@ -113,34 +144,10 @@ class SyncService extends ChangeNotifier {
     notifyListeners();
   }
 
-  /// 다른 기기의 코드로 갈아탄다. 이 기기의 데이터도 그 코드 아래로 밀어 넣어
-  /// 양쪽이 합쳐진다 (id 가 다르므로 겹치지 않는다).
-  Future<void> useKey(String key) async {
-    if (key == _syncKey) return;
-    await _cancelRemote();
-    _storeKey(key);
-    _syncKey = key;
-    _subscribeRemote();
-    try {
-      await _pushAll();
-      _connected = true;
-      _lastError = null;
-    } catch (e) {
-      _connected = false;
-      _lastError = '$e';
-    }
-    notifyListeners();
-  }
-
-  @override
-  void dispose() {
-    _retryTimer?.cancel();
-    _cancelRemote();
-    _localSubscription?.cancel();
-    super.dispose();
-  }
-
   // ---- 원격 → 로컬 --------------------------------------------------------
+
+  DocumentReference<Map<String, dynamic>> get _space =>
+      _firestore.collection('users').doc(_uid);
 
   void _subscribeRemote() {
     _subscriptions.addAll([
@@ -150,9 +157,10 @@ class SyncService extends ChangeNotifier {
     ]);
   }
 
-  Future<void> _cancelRemote() async {
+  // 구독 해제 완료를 기다리지 않는다. 기다리면 로그아웃 처리가 그 뒤로 밀린다.
+  void _cancelRemote() {
     for (final s in _subscriptions) {
-      await s.cancel();
+      unawaited(s.cancel());
     }
     _subscriptions.clear();
   }

@@ -15,6 +15,7 @@ import 'firebase_options.dart';
 import 'screens/input_tab.dart';
 import 'screens/settings_page.dart';
 import 'screens/study_tab.dart';
+import 'services/auth_gateway.dart';
 import 'services/startup_settings.dart';
 import 'services/sync_service.dart';
 
@@ -67,13 +68,9 @@ Future<SyncService?> _startSync(AppState state) async {
       state: state,
       firestore: FirebaseFirestore.instance,
       prefs: await SharedPreferences.getInstance(),
-      signIn: () async {
-        if (FirebaseAuth.instance.currentUser == null) {
-          await FirebaseAuth.instance.signInAnonymously();
-        }
-      },
+      auth: FirebaseAuthGateway(FirebaseAuth.instance),
     );
-    // 연결은 기다리지 않는다. 오프라인이면 설정 화면에 "연결 안 됨"으로 보인다.
+    // 로그인 상태에 따라 알아서 연결한다. 기다리지 않는다.
     unawaited(sync.start());
     return sync;
   } catch (e) {
@@ -149,6 +146,17 @@ class _HomePageState extends State<HomePage>
     super.dispose();
   }
 
+  void _openSettings() {
+    Navigator.of(context).push(
+      MaterialPageRoute<void>(
+        builder: (_) => SettingsPage(
+          startupSettings: widget.startupSettings,
+          sync: widget.sync,
+        ),
+      ),
+    );
+  }
+
   void _onNavigationRequest() {
     _tabs.animateTo(widget.navigation!.requestedTab);
   }
@@ -159,17 +167,26 @@ class _HomePageState extends State<HomePage>
       appBar: AppBar(
         title: const Text(DesktopShell.appName),
         actions: [
+          if (widget.sync != null)
+            ListenableBuilder(
+              listenable: widget.sync!,
+              builder: (context, _) {
+                final user = widget.sync!.user;
+                return IconButton(
+                  tooltip: user == null ? '로그인' : '${user.email} (동기화 중)',
+                  icon: Icon(
+                    user == null
+                        ? Icons.account_circle_outlined
+                        : Icons.account_circle,
+                  ),
+                  onPressed: _openSettings,
+                );
+              },
+            ),
           IconButton(
             tooltip: '설정',
             icon: const Icon(Icons.settings),
-            onPressed: () => Navigator.of(context).push(
-              MaterialPageRoute<void>(
-                builder: (_) => SettingsPage(
-                  startupSettings: widget.startupSettings,
-                  sync: widget.sync,
-                ),
-              ),
-            ),
+            onPressed: _openSettings,
           ),
         ],
         bottom: TabBar(
